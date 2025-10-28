@@ -1,4 +1,5 @@
 use clap::Parser;
+use globset::Glob;
 use notify::RecursiveMode;
 use notify_debouncer_mini::new_debouncer;
 use std::path::Path;
@@ -7,8 +8,12 @@ use std::time::Duration;
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(default_value = ".")]
-    path: String,
+    #[arg(short, long, default_value = "**/*")]
+    pattern: String,
+
+    #[arg(short, long, default_value = ".")]
+    dir: String,
+
     command: String,
 }
 
@@ -17,28 +22,23 @@ fn run_command(command: &str) {
     println!("---");
 
     let output = if cfg!(target_os = "windows") {
-        Command::new("cmd")
-            .args(["/C", command])
-            .output()
+        Command::new("cmd").args(["/C", command]).output()
     } else {
-        Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .output()
+        Command::new("sh").arg("-c").arg(command).output()
     };
 
     match output {
         Ok(output) => {
             print!("{}", String::from_utf8_lossy(&output.stdout));
             print!("{}", String::from_utf8_lossy(&output.stderr));
-            
+
             if output.status.success() {
                 println!("success");
             } else {
-                println!("failed with: {}", output.status);
+                println!("failed: {}", output.status);
             }
         }
-        Err(e) => println!("error executing: {}", e),
+        Err(e) => println!("error: {}", e),
     }
     println!("---\n");
 }
@@ -46,9 +46,13 @@ fn run_command(command: &str) {
 fn main() {
     let args = Args::parse();
 
-    println!("watching: {}", args.path);
+    let glob = Glob::new(&args.pattern)
+        .expect("invalid glob pattern")
+        .compile_matcher();
+
+    println!("watching {} (pattern: {})", args.dir, args.pattern);
     println!("command: {}\n", args.command);
-    
+
     run_command(&args.command);
 
     let (tx, rx) = std::sync::mpsc::channel();
@@ -58,15 +62,19 @@ fn main() {
 
     debouncer
         .watcher()
-        .watch(Path::new(&args.path), RecursiveMode::Recursive)
-        .expect("failed to watch path");
+        .watch(Path::new(&args.dir), RecursiveMode::Recursive)
+        .expect("failed to watch");
 
     for result in rx {
         match result {
-            Ok(_) => {
-                run_command(&args.command);
+            Ok(events) => {
+                let matched = events.iter().any(|e| glob.is_match(&e.path));
+                
+                if matched {
+                    run_command(&args.command);
+                }
             }
-            Err(e) => println!("watch error: {:?}", e),
+            Err(e) => println!("error: {:?}", e),
         }
     }
 }
