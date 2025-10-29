@@ -1,9 +1,10 @@
 use clap::Parser;
+use colored::*;
 use globset::Glob;
 use notify::RecursiveMode;
 use notify_debouncer_mini::new_debouncer;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, exit};
 use std::time::Duration;
 
 #[derive(Parser, Debug)]
@@ -36,8 +37,8 @@ fn run_command(command: &str, should_clear: bool) {
         clear_screen();
     }
 
-    println!("\nrunning: {}", command);
-    println!("---");
+    println!("\n{} {}", "running:".cyan(), command);
+    println!("{}", "---".dimmed());
 
     let output = if cfg!(target_os = "windows") {
         Command::new("cmd").args(["/C", command]).output()
@@ -51,39 +52,60 @@ fn run_command(command: &str, should_clear: bool) {
             print!("{}", String::from_utf8_lossy(&output.stderr));
 
             if output.status.success() {
-                println!("done");
+                println!("{}", "done".green());
             } else {
-                println!("failed: {}", output.status);
+                println!("{} {}", "failed:".red(), output.status);
             }
         }
-        Err(e) => println!("error: {}", e),
+        Err(e) => println!("{} {}", "error:".red(), e),
     }
-    println!("---");
-    println!("waiting for changes...\n");
+    println!("{}", "---".dimmed());
+    println!("{}", "waiting...".dimmed());
 }
 
 fn main() {
     let args = Args::parse();
 
-    let glob = Glob::new(&args.pattern)
-        .expect("invalid pattern")
-        .compile_matcher();
+    let watch_path = Path::new(&args.dir);
+    if !watch_path.exists() {
+        eprintln!("{} directory '{}' doesnt exist", "error:".red(), args.dir);
+        exit(1);
+    }
+    if !watch_path.is_dir() {
+        eprintln!("{} '{}' is not a directory", "error:".red(), args.dir);
+        exit(1);
+    }
 
-    println!("watching {} ({})", args.dir, args.pattern);
-    println!("debounce: {}ms", args.debounce);
-    println!("command: {}\n", args.command);
+    let glob = match Glob::new(&args.pattern) {
+        Ok(g) => g.compile_matcher(),
+        Err(e) => {
+            eprintln!("{} invalid pattern: {}", "error:".red(), e);
+            exit(1);
+        }
+    };
+
+    println!("{} {} ({})", "watching:".blue(), args.dir, args.pattern.yellow());
+    println!("{} {}", "command:".blue(), args.command);
+    println!("{} {}ms", "debounce:".blue(), args.debounce);
 
     run_command(&args.command, args.clear);
 
     let (tx, rx) = std::sync::mpsc::channel();
 
-    let mut debouncer = new_debouncer(Duration::from_millis(args.debounce), tx)
-        .expect("failed to create debouncer");
+    let mut debouncer = match new_debouncer(Duration::from_millis(args.debounce), tx) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{} {}", "failed to create watcher:".red(), e);
+            exit(1);
+        }
+    };
 
-    debouncer
-        .watcher()
-        .watch(Path::new(&args.dir), RecursiveMode::Recursive)
-        .expect("failed to watch");
+    if let Err(e) = debouncer.watcher().watch(watch_path, RecursiveMode::Recursive) {
+        eprintln!("{} {}", "failed to watch:".red(), e);
+        exit(1);
+    }
+
+    println!("{}\n", "started, ctrl+c to stop".green());
 
     for result in rx {
         match result {
@@ -94,11 +116,11 @@ fn main() {
                     .collect();
 
                 if !matched_files.is_empty() {
-                    println!("\nchanged: {}", matched_files[0].path.display());
+                    println!("\n{} {}", "changed:".yellow(), matched_files[0].path.display());
                     run_command(&args.command, args.clear);
                 }
             }
-            Err(e) => println!("error: {:?}", e),
+            Err(e) => eprintln!("{} {:?}", "watch error:".yellow(), e),
         }
     }
 }
