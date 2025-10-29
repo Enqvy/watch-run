@@ -14,10 +14,28 @@ struct Args {
     #[arg(short, long, default_value = ".")]
     dir: String,
 
+    #[arg(long, default_value = "500")]
+    debounce: u64,
+
+    #[arg(short, long)]
+    clear: bool,
+
     command: String,
 }
 
-fn run_command(command: &str) {
+fn clear_screen() {
+    if cfg!(target_os = "windows") {
+        Command::new("cmd").args(["/C", "cls"]).status().ok();
+    } else {
+        Command::new("clear").status().ok();
+    }
+}
+
+fn run_command(command: &str, should_clear: bool) {
+    if should_clear {
+        clear_screen();
+    }
+
     println!("\nrunning: {}", command);
     println!("---");
 
@@ -33,31 +51,33 @@ fn run_command(command: &str) {
             print!("{}", String::from_utf8_lossy(&output.stderr));
 
             if output.status.success() {
-                println!("success");
+                println!("done");
             } else {
                 println!("failed: {}", output.status);
             }
         }
         Err(e) => println!("error: {}", e),
     }
-    println!("---\n");
+    println!("---");
+    println!("waiting for changes...\n");
 }
 
 fn main() {
     let args = Args::parse();
 
     let glob = Glob::new(&args.pattern)
-        .expect("invalid glob pattern")
+        .expect("invalid pattern")
         .compile_matcher();
 
-    println!("watching {} (pattern: {})", args.dir, args.pattern);
+    println!("watching {} ({})", args.dir, args.pattern);
+    println!("debounce: {}ms", args.debounce);
     println!("command: {}\n", args.command);
 
-    run_command(&args.command);
+    run_command(&args.command, args.clear);
 
     let (tx, rx) = std::sync::mpsc::channel();
 
-    let mut debouncer = new_debouncer(Duration::from_millis(500), tx)
+    let mut debouncer = new_debouncer(Duration::from_millis(args.debounce), tx)
         .expect("failed to create debouncer");
 
     debouncer
@@ -68,10 +88,14 @@ fn main() {
     for result in rx {
         match result {
             Ok(events) => {
-                let matched = events.iter().any(|e| glob.is_match(&e.path));
-                
-                if matched {
-                    run_command(&args.command);
+                let matched_files: Vec<_> = events
+                    .iter()
+                    .filter(|e| glob.is_match(&e.path))
+                    .collect();
+
+                if !matched_files.is_empty() {
+                    println!("\nchanged: {}", matched_files[0].path.display());
+                    run_command(&args.command, args.clear);
                 }
             }
             Err(e) => println!("error: {:?}", e),
