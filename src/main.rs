@@ -1,6 +1,6 @@
 use clap::Parser;
 use colored::*;
-use globset::Glob;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use notify::RecursiveMode;
 use notify_debouncer_mini::new_debouncer;
 use std::path::Path;
@@ -9,8 +9,8 @@ use std::time::Duration;
 
 #[derive(Parser, Debug)]
 struct Args {
-    #[arg(short, long, default_value = "**/*")]
-    pattern: String,
+    #[arg(short, long, num_args = 1.., default_value = "**/*")]
+    pattern: Vec<String>,
 
     #[arg(short, long, default_value = ".")]
     dir: String,
@@ -63,28 +63,37 @@ fn run_command(command: &str, should_clear: bool) {
     println!("{}", "waiting...".dimmed());
 }
 
+fn build_globset(patterns: &[String]) -> Result<GlobSet, globset::Error> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(Glob::new(pattern)?);
+    }
+    builder.build()
+}
+
 fn main() {
     let args = Args::parse();
 
     let watch_path = Path::new(&args.dir);
     if !watch_path.exists() {
-        eprintln!("{} directory '{}' doesnt exist", "error:".red(), args.dir);
+        eprintln!("{} directory doesnt exist", "error:".red());
         exit(1);
     }
     if !watch_path.is_dir() {
-        eprintln!("{} '{}' is not a directory", "error:".red(), args.dir);
+        eprintln!("{} not a directory", "error:".red());
         exit(1);
     }
 
-    let glob = match Glob::new(&args.pattern) {
-        Ok(g) => g.compile_matcher(),
+    let globset = match build_globset(&args.pattern) {
+        Ok(g) => g,
         Err(e) => {
             eprintln!("{} invalid pattern: {}", "error:".red(), e);
             exit(1);
         }
     };
 
-    println!("{} {} ({})", "watching:".blue(), args.dir, args.pattern.yellow());
+    println!("{} {}", "watching:".blue(), args.dir);
+    println!("{} {}", "patterns:".blue(), args.pattern.join(", ").yellow());
     println!("{} {}", "command:".blue(), args.command);
     println!("{} {}ms", "debounce:".blue(), args.debounce);
 
@@ -105,14 +114,14 @@ fn main() {
         exit(1);
     }
 
-    println!("{}\n", "started, ctrl+c to stop".green());
+    println!("{}\n", "started".green());
 
     for result in rx {
         match result {
             Ok(events) => {
                 let matched_files: Vec<_> = events
                     .iter()
-                    .filter(|e| glob.is_match(&e.path))
+                    .filter(|e| globset.is_match(&e.path))
                     .collect();
 
                 if !matched_files.is_empty() {
