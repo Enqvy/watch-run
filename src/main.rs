@@ -26,29 +26,82 @@ struct Args {
     #[arg(long, default_value = ".watchrun.toml")]
     config: String,
 
-    command: Option<String>,
+    #[arg(short, long, num_args = 0..)]
+    ignore: Vec<String>,
+
+    command: Vec<String>,
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)]
 struct Config {
     #[serde(default = "default_dir")]
     dir: String,
-    #[serde(default = "default_patterns")]
+    #[serde(default)]
     patterns: Vec<String>,
+    #[serde(default)]
+    commands: Vec<String>,
     #[serde(default)]
     command: Option<String>,
     #[serde(default = "default_debounce")]
     debounce: u64,
     #[serde(default)]
     clear: bool,
+    #[serde(default)]
+    ignore: Vec<String>,
+}
+
+impl Config {
+    fn get_commands(&self) -> Vec<String> {
+        if !self.commands.is_empty() {
+            self.commands.clone()
+        } else if let Some(cmd) = &self.command {
+            vec![cmd.clone()]
+        } else {
+            vec![]
+        }
+    }
+
+    fn build_globsets(&self, extra_patterns: &[String], extra_ignores: &[String]) -> Result<(GlobSet, GlobSet), globset::Error> {
+        let mut watch_builder = GlobSetBuilder::new();
+        let mut ignore_builder = GlobSetBuilder::new();
+
+        if !extra_patterns.is_empty() {
+            for pattern in extra_patterns {
+                watch_builder.add(Glob::new(pattern)?);
+            }
+        } else if !self.patterns.is_empty() {
+            for pattern in &self.patterns {
+                watch_builder.add(Glob::new(pattern)?);
+            }
+        } else {
+            watch_builder.add(Glob::new("**/*")?);
+        }
+
+        for pattern in &self.ignore {
+            ignore_builder.add(Glob::new(pattern)?);
+        }
+
+        for pattern in extra_ignores {
+            ignore_builder.add(Glob::new(pattern)?);
+        }
+
+        let default_ignores = vec![
+            "**/target/**",
+            "**/node_modules/**",
+            "**/.git/**",
+            "**/.watchrun.toml",
+        ];
+
+        for pattern in default_ignores {
+            ignore_builder.add(Glob::new(pattern)?);
+        }
+
+        Ok((watch_builder.build()?, ignore_builder.build()?))
+    }
 }
 
 fn default_dir() -> String {
     ".".to_string()
-}
-
-fn default_patterns() -> Vec<String> {
-    vec!["**/*".to_string()]
 }
 
 fn default_debounce() -> u64 {
@@ -72,78 +125,75 @@ fn clear_screen() {
     }
 }
 
-fn run_command(command: &str, should_clear: bool) {
+fn run_commands(commands: &[String], should_clear: bool) {
     if should_clear {
         clear_screen();
     }
 
-    println!("\n{} {}", "running:".cyan(), command);
-    println!("{}", "---".dimmed());
+    for command in commands {
+        println!("\n{} {}", "running:".cyan(), command);
+        println!("{}", "---".dimmed());
 
-    let output = if cfg!(target_os = "windows") {
-        Command::new("cmd").args(["/C", command]).output()
-    } else {
-        Command::new("sh").arg("-c").arg(command).output()
-    };
+        let output = if cfg!(target_os = "windows") {
+            Command::new("cmd").args(["/C", command]).output()
+        } else {
+            Command::new("sh").arg("-c").arg(command).output()
+        };
 
-    match output {
-        Ok(output) => {
-            print!("{}", String::from_utf8_lossy(&output.stdout));
-            print!("{}", String::from_utf8_lossy(&output.stderr));
+        match output {
+            Ok(output) => {
+                print!("{}", String::from_utf8_lossy(&output.stdout));
+                print!("{}", String::from_utf8_lossy(&output.stderr));
 
-            if output.status.success() {
-                println!("{}", "done".green());
-            } else {
-                println!("{} {}", "failed:".red(), output.status);
+                if output.status.success() {
+                    println!("{}", "done".green());
+                } else {
+                    println!("{} {}", "failed:".red(), output.status);
+                    break;
+                }
+            }
+            Err(e) => {
+                println!("{} {}", "error:".red(), e);
+                break;
             }
         }
-        Err(e) => println!("{} {}", "error:".red(), e),
     }
+    
     println!("{}", "---".dimmed());
     println!("{}", "waiting...".dimmed());
-}
-
-fn build_globset(patterns: &[String]) -> Result<GlobSet, globset::Error> {
-    let mut builder = GlobSetBuilder::new();
-    for pattern in patterns {
-        builder.add(Glob::new(pattern)?);
-    }
-    builder.build()
 }
 
 fn main() {
     let args = Args::parse();
 
-    let config = load_config(&args.config);
+    let config = load_config(&args.config).unwrap_or_else(|| Config {
+        dir: default_dir(),
+        patterns: vec![],
+        commands: vec![],
+        command: None,
+        debounce: default_debounce(),
+        clear: false,
+        ignore: vec![],
+    });
 
     let dir = args.dir
-        .or_else(|| config.as_ref().map(|c| c.dir.clone()))
-        .unwrap_or_else(default_dir);
+        .unwrap_or_else(|| config.dir.clone());
     
-    let patterns = if !args.pattern.is_empty() {
-        args.pattern
+    let commands = if !args.command.is_empty() {
+        args.command
     } else {
-        config.as_ref()
-            .map(|c| c.patterns.clone())
-            .unwrap_or_else(default_patterns)
+        config.get_commands()
     };
 
-    let command = args.command
-        .or_else(|| config.as_ref().and_then(|c| c.command.clone()));
-    
-    let command = match command {
-        Some(cmd) => cmd,
-        None => {
-            eprintln!("{} no command specified", "error:".red());
-            exit(1);
-        }
-    };
+    if commands.is_empty() {
+        eprintln!("{} no command specifed", "error:".red());
+        exit(1);
+    }
 
     let debounce = args.debounce
-        .or_else(|| config.as_ref().map(|c| c.debounce))
-        .unwrap_or_else(default_debounce);
+        .unwrap_or(config.debounce);
 
-    let clear = args.clear || config.as_ref().map(|c| c.clear).unwrap_or(false);
+    let clear = args.clear || config.clear;
 
     let watch_path = Path::new(&dir);
     if !watch_path.exists() {
@@ -151,7 +201,7 @@ fn main() {
         exit(1);
     }
 
-    let globset = match build_globset(&patterns) {
+    let (watch_globset, ignore_globset) = match config.build_globsets(&args.pattern, &args.ignore) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("{} invalid pattern: {}", "error:".red(), e);
@@ -159,12 +209,20 @@ fn main() {
         }
     };
 
+    let display_patterns = if !args.pattern.is_empty() {
+        args.pattern.clone()
+    } else if !config.patterns.is_empty() {
+        config.patterns.clone()
+    } else {
+        vec!["**/*".to_string()]
+    };
+
     println!("{} {}", "watching:".blue(), dir);
-    println!("{} {}", "patterns:".blue(), patterns.join(", ").yellow());
-    println!("{} {}", "command:".blue(), command);
+    println!("{} {}", "patterns:".blue(), display_patterns.join(", ").yellow());
+    println!("{} {}", "commands:".blue(), commands.join(" && "));
     println!("{} {}ms", "debounce:".blue(), debounce);
 
-    run_command(&command, clear);
+    run_commands(&commands, clear);
 
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -188,12 +246,14 @@ fn main() {
             Ok(events) => {
                 let matched_files: Vec<_> = events
                     .iter()
-                    .filter(|e| globset.is_match(&e.path))
+                    .filter(|e| {
+                        watch_globset.is_match(&e.path) && !ignore_globset.is_match(&e.path)
+                    })
                     .collect();
 
                 if !matched_files.is_empty() {
                     println!("\n{} {}", "changed:".yellow(), matched_files[0].path.display());
-                    run_command(&command, clear);
+                    run_commands(&commands, clear);
                 }
             }
             Err(e) => eprintln!("{} {:?}", "error:".yellow(), e),
@@ -206,23 +266,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_build_globset() {
-        let patterns = vec!["**/*.rs".to_string(), "**/*.toml".to_string()];
-        let result = build_globset(&patterns);
+    fn test_build_globsets() {
+        let config = Config {
+            dir: ".".to_string(),
+            patterns: vec!["**/*.rs".to_string()],
+            commands: vec![],
+            command: None,
+            debounce: 500,
+            clear: false,
+            ignore: vec!["**/test/**".to_string()],
+        };
+        
+        let result = config.build_globsets(&[], &[]);
         assert!(result.is_ok());
     }
 
     #[test]
-    fn test_invalid_glob() {
-        let patterns = vec!["[invalid".to_string()];
-        let result = build_globset(&patterns);
-        assert!(result.is_err());
+    fn test_get_commands_priority() {
+        let config = Config {
+            dir: ".".to_string(),
+            patterns: vec![],
+            commands: vec!["cmd1".to_string(), "cmd2".to_string()],
+            command: Some("old_cmd".to_string()),
+            debounce: 500,
+            clear: false,
+            ignore: vec![],
+        };
+        
+        assert_eq!(config.get_commands(), vec!["cmd1", "cmd2"]);
+    }
+
+    #[test]
+    fn test_get_commands_fallback() {
+        let config = Config {
+            dir: ".".to_string(),
+            patterns: vec![],
+            commands: vec![],
+            command: Some("fallback_cmd".to_string()),
+            debounce: 500,
+            clear: false,
+            ignore: vec![],
+        };
+        
+        assert_eq!(config.get_commands(), vec!["fallback_cmd"]);
     }
 
     #[test]
     fn defaults_work() {
         assert_eq!(default_dir(), ".");
-        assert_eq!(default_patterns(), vec!["**/*"]);
         assert_eq!(default_debounce(), 500);
     }
 }
